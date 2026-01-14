@@ -9,6 +9,7 @@ from resources in private VNets.
 import json
 import logging
 import os
+import secrets
 from datetime import timedelta
 
 from azure.identity import DefaultAzureCredential
@@ -16,6 +17,9 @@ from azure.monitor.query import LogsQueryClient, LogsQueryStatus
 from azure.core.exceptions import HttpResponseError
 from dotenv import load_dotenv
 from mcp.server.fastmcp import FastMCP
+from mcp.server.transport_security import TransportSecuritySettings
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.responses import JSONResponse
 
 # Load environment variables
 load_dotenv()
@@ -24,12 +28,36 @@ load_dotenv()
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("log-analytics-mcp")
 
+# API Key for authentication (optional - if not set, auth is disabled)
+API_KEY = os.getenv("MCP_API_KEY")
+API_KEY_HEADER = os.getenv("MCP_API_KEY_HEADER", "X-API-Key")
+
+if API_KEY:
+    logger.info(f"API key authentication enabled (header: {API_KEY_HEADER})")
+else:
+    logger.warning("No MCP_API_KEY set - authentication is disabled!")
+
 # Initialize Azure credential
 credential = DefaultAzureCredential()
 logs_client = LogsQueryClient(credential)
 
-# Create MCP server using FastMCP (the modern API)
-mcp = FastMCP("log-analytics-mcp-server")
+# Get the Azure Container Apps host for allowed hosts
+ACA_HOST = os.getenv("ACA_HOST", "log-analytics-mcp.happydune-ad37d82a.eastus2.azurecontainerapps.io")
+
+# Disable DNS rebinding protection for cloud deployments where hostname varies
+# This is safe when using API key authentication
+transport_security = TransportSecuritySettings(
+    enable_dns_rebinding_protection=False
+)
+
+# Create MCP server using FastMCP with stateless HTTP and JSON responses (recommended for production)
+# stateless_http=True disables session management for scalable cloud deployments
+mcp = FastMCP(
+    "log-analytics-mcp-server",
+    stateless_http=True,
+    json_response=True,
+    transport_security=transport_security
+)
 
 
 def get_workspace_id(workspace_id: str | None = None) -> str | None:
@@ -364,7 +392,8 @@ if __name__ == "__main__":
     
     # Check for transport argument
     transport = "sse"
-    port = 3001
+    port = int(os.getenv("PORT", "8000"))
+    host = os.getenv("HOST", "0.0.0.0")  # Default to 0.0.0.0 for container deployments
     
     for i, arg in enumerate(sys.argv[1:], 1):
         if arg in ["--transport", "-t"]:
@@ -373,6 +402,9 @@ if __name__ == "__main__":
         elif arg in ["--port", "-p"]:
             if i < len(sys.argv) - 1:
                 port = int(sys.argv[i + 1])
+        elif arg in ["--host"]:
+            if i < len(sys.argv) - 1:
+                host = sys.argv[i + 1]
         elif arg == "stdio":
             transport = "stdio"
         elif arg == "sse":
@@ -381,8 +413,68 @@ if __name__ == "__main__":
     logger.info(f"Starting Log Analytics MCP Server with {transport} transport")
     
     if transport == "sse":
-        logger.info(f"SSE endpoint will be at: http://localhost:{port}/sse")
-        # FastMCP handles the SSE setup
-        mcp.run(transport="sse")
+        logger.info(f"MCP endpoint will be at: http://{host}:{port}/mcp")
+        logger.info(f"Health endpoint will be at: http://{host}:{port}/health")
+        import contextlib
+        import uvicorn
+        from starlette.applications import Starlette
+        from starlette.routing import Route, Mount
+        from starlette.responses import JSONResponse
+        from starlette.middleware import Middleware
+        
+        # Configure FastMCP for streamable HTTP
+        mcp.settings.streamable_http_path = "/"
+        
+        logger.info("Using Streamable HTTP transport")
+        
+        # Health check endpoint
+        async def health_check(request):
+            return JSONResponse({"status": "healthy", "server": "log-analytics-mcp"})
+        
+        # API Key authentication middleware
+        class APIKeyMiddleware(BaseHTTPMiddleware):
+            async def dispatch(self, request, call_next):
+                # Skip auth for health endpoint
+                if request.url.path == "/health":
+                    return await call_next(request)
+                
+                # If API key is configured, validate it
+                if API_KEY:
+                    provided_key = request.headers.get(API_KEY_HEADER)
+                    if not provided_key:
+                        logger.warning(f"Missing API key header: {API_KEY_HEADER}")
+                        return JSONResponse(
+                            {"error": "Missing API key", "header": API_KEY_HEADER},
+                            status_code=401
+                        )
+                    if not secrets.compare_digest(provided_key, API_KEY):
+                        logger.warning("Invalid API key provided")
+                        return JSONResponse(
+                            {"error": "Invalid API key"},
+                            status_code=403
+                        )
+                
+                return await call_next(request)
+        
+        # Create a combined lifespan to manage the session manager
+        @contextlib.asynccontextmanager
+        async def lifespan(app: Starlette):
+            async with mcp.session_manager.run():
+                yield
+        
+        # Create Starlette app with streamable HTTP mounted at /mcp
+        app = Starlette(
+            debug=True,
+            routes=[
+                Route("/health", health_check),
+                Mount("/mcp", app=mcp.streamable_http_app()),
+            ],
+            lifespan=lifespan,
+        )
+        
+        # Add authentication middleware
+        app.add_middleware(APIKeyMiddleware)
+        
+        uvicorn.run(app, host=host, port=port)
     else:
         mcp.run(transport="stdio")

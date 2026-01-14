@@ -6,6 +6,8 @@
 
 A [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) server that enables AI agents to query Azure Log Analytics workspaces using KQL (Kusto Query Language). This bridges AI assistants like GitHub Copilot, Claude, and Azure SRE Agent with your observability data.
 
+**Supports both local (stdio) and remote (HTTP) deployment modes.**
+
 ## 🎯 Use Cases
 
 - **Incident Investigation**: Query logs from VMs, containers, and Azure resources during incidents
@@ -267,9 +269,172 @@ ContainerLog
 | Environment Variable | Required | Description |
 |---------------------|----------|-------------|
 | `LOG_ANALYTICS_WORKSPACE_ID` | Yes | The GUID of your Log Analytics workspace |
+| `MCP_API_KEY` | No* | API key for authentication (required for remote deployment) |
+| `MCP_API_KEY_HEADER` | No | Custom header name for API key (default: `X-API-Key`) |
 | `AZURE_TENANT_ID` | No | Azure AD tenant ID (for service principal auth) |
 | `AZURE_CLIENT_ID` | No | Service principal client ID |
 | `AZURE_CLIENT_SECRET` | No | Service principal secret |
+
+---
+
+## 🌐 Remote Deployment (Azure Container Apps)
+
+For production use with Azure SRE Agent or other remote MCP clients, deploy this server to Azure Container Apps.
+
+### Prerequisites
+
+- Azure CLI installed and logged in (`az login`)
+- Docker (for local testing only)
+- An Azure subscription
+
+### Step 1: Create Azure Resources
+
+```bash
+# Set variables
+RESOURCE_GROUP="log-analytics-mcp-rg"
+LOCATION="eastus2"
+ACR_NAME="yourregistryname"  # Must be globally unique
+CONTAINER_APP_NAME="log-analytics-mcp"
+WORKSPACE_ID="your-log-analytics-workspace-guid"
+API_KEY=$(openssl rand -base64 32 | tr -d '/+=' | head -c 32)
+
+# Create resource group
+az group create --name $RESOURCE_GROUP --location $LOCATION
+
+# Create container registry
+az acr create --resource-group $RESOURCE_GROUP --name $ACR_NAME --sku Basic --admin-enabled true
+
+# Create container apps environment
+az containerapp env create \
+  --name "${CONTAINER_APP_NAME}-env" \
+  --resource-group $RESOURCE_GROUP \
+  --location $LOCATION
+```
+
+### Step 2: Build and Push Container Image
+
+```bash
+# Build image in ACR (from the log-analytics-mcp-server directory)
+az acr build --registry $ACR_NAME --image log-analytics-mcp:v1 .
+```
+
+### Step 3: Deploy Container App
+
+```bash
+# Get ACR credentials
+ACR_PASSWORD=$(az acr credential show --name $ACR_NAME --query "passwords[0].value" -o tsv)
+
+# Create container app with managed identity
+az containerapp create \
+  --name $CONTAINER_APP_NAME \
+  --resource-group $RESOURCE_GROUP \
+  --environment "${CONTAINER_APP_NAME}-env" \
+  --image "${ACR_NAME}.azurecr.io/log-analytics-mcp:v1" \
+  --target-port 8000 \
+  --ingress external \
+  --min-replicas 1 \
+  --max-replicas 10 \
+  --cpu 0.5 \
+  --memory 1.0Gi \
+  --registry-server "${ACR_NAME}.azurecr.io" \
+  --registry-username $ACR_NAME \
+  --registry-password "$ACR_PASSWORD" \
+  --env-vars \
+    "LOG_ANALYTICS_WORKSPACE_ID=$WORKSPACE_ID" \
+    "MCP_API_KEY=$API_KEY" \
+  --system-assigned
+
+# Get the container app URL
+FQDN=$(az containerapp show --name $CONTAINER_APP_NAME --resource-group $RESOURCE_GROUP --query "properties.configuration.ingress.fqdn" -o tsv)
+echo "MCP Server URL: https://${FQDN}/mcp/"
+echo "Health Check: https://${FQDN}/health"
+echo "API Key: $API_KEY"
+```
+
+### Step 4: Grant Log Analytics Access
+
+```bash
+# Get managed identity principal ID
+PRINCIPAL_ID=$(az containerapp show --name $CONTAINER_APP_NAME --resource-group $RESOURCE_GROUP --query "identity.principalId" -o tsv)
+
+# Grant Log Analytics Reader role on the workspace
+# Replace with your Log Analytics workspace resource ID
+LA_RESOURCE_ID="/subscriptions/YOUR_SUB/resourceGroups/YOUR_RG/providers/Microsoft.OperationalInsights/workspaces/YOUR_WORKSPACE"
+
+az role assignment create \
+  --assignee $PRINCIPAL_ID \
+  --role "Log Analytics Reader" \
+  --scope $LA_RESOURCE_ID
+```
+
+### Step 5: Test the Deployment
+
+```bash
+# Test health endpoint
+curl "https://${FQDN}/health"
+
+# Test MCP initialization
+curl -X POST "https://${FQDN}/mcp/" \
+  -H "X-API-Key: $API_KEY" \
+  -H "Content-Type: application/json" \
+  -H "Accept: application/json, text/event-stream" \
+  -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"1.0"}}}'
+
+# List available tools
+curl -X POST "https://${FQDN}/mcp/" \
+  -H "X-API-Key: $API_KEY" \
+  -H "Content-Type: application/json" \
+  -H "Accept: application/json, text/event-stream" \
+  -d '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}'
+```
+
+### Remote Integration Examples
+
+#### Azure SRE Agent
+
+Configure in the SRE Agent portal:
+
+| Setting | Value |
+|---------|-------|
+| **Name** | `LogAnalyticsMCP` |
+| **Transport** | `Streamable HTTP` |
+| **URL** | `https://your-app.azurecontainerapps.io/mcp/` |
+| **Authentication** | `API Key` |
+| **Header Name** | `X-API-Key` |
+| **API Key** | Your generated API key |
+
+#### Remote MCP Client Configuration
+
+For any MCP client that supports HTTP transport:
+
+```json
+{
+  "servers": {
+    "log-analytics": {
+      "type": "http",
+      "url": "https://your-app.azurecontainerapps.io/mcp/",
+      "headers": {
+        "X-API-Key": "your-api-key"
+      }
+    }
+  }
+}
+```
+
+### Updating the Deployment
+
+```bash
+# Build new version
+az acr build --registry $ACR_NAME --image log-analytics-mcp:v2 .
+
+# Update container app
+az containerapp update \
+  --name $CONTAINER_APP_NAME \
+  --resource-group $RESOURCE_GROUP \
+  --image "${ACR_NAME}.azurecr.io/log-analytics-mcp:v2"
+```
+
+---
 
 ## 🧪 Development
 
