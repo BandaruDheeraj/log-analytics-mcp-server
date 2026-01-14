@@ -48,3 +48,12 @@ Thumbs.db
 .pytest_cache/
 .coverage
 htmlcov/
+
+# SRECTL workspace artifacts (not part of this MCP server)
+.github/
+agents/
+tools/
+skills/
+scheduledtasks/
+body.json
+deploy-to-aca.sh

@@ -6,12 +6,12 @@
 
 A [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) server that enables AI agents to query Azure Log Analytics workspaces using KQL (Kusto Query Language). This bridges AI assistants like GitHub Copilot, Claude, and Azure SRE Agent with your observability data.
 
-**Supports both local (stdio) and remote (HTTP) deployment modes.**
+**Supports both local (stdio) and remote (Streamable HTTP) deployment modes.**
 
 ## 🎯 Use Cases
 
+- **Private VNet Observability**: Query logs from workspaces protected by Private Link—when public queries are blocked, deploy this server inside the VNet as a trusted query proxy
 - **Incident Investigation**: Query logs from VMs, containers, and Azure resources during incidents
-- **Private VNet Observability**: Access logs from resources with no public IPs via Log Analytics + Private Link
 - **Cross-Resource Correlation**: Query multiple VMs/resources in a single natural language request
 - **Performance Analysis**: Analyze CPU, memory, disk metrics across your infrastructure
 
@@ -432,6 +432,95 @@ az containerapp update \
   --name $CONTAINER_APP_NAME \
   --resource-group $RESOURCE_GROUP \
   --image "${ACR_NAME}.azurecr.io/log-analytics-mcp:v2"
+```
+
+---
+
+## 🔒 VNet Deployment (Private Link Scenarios)
+
+When your Log Analytics workspace is protected by Private Link with `publicNetworkAccessForQuery: Disabled`, external queries are blocked. Deploy this MCP server **inside the VNet** to act as a trusted query proxy.
+
+### Why This Matters
+
+```
+External Query → Log Analytics  ❌ BLOCKED by Private Link
+VNet MCP → Log Analytics        ✅ ALLOWED via Private Endpoint  
+SRE Agent → VNet MCP            ✅ HTTPS (Streamable HTTP)
+```
+
+### VNet-Integrated Deployment
+
+```bash
+# Create VNet-integrated Container Apps environment
+az containerapp env create \
+  --name vnet-test-env \
+  --resource-group $RESOURCE_GROUP \
+  --location eastus \
+  --infrastructure-subnet-resource-id "/subscriptions/.../subnets/infrastructure"
+
+# Create ACR (VNet environments can't pull from public registries)
+az acr create --resource-group $RESOURCE_GROUP --name $ACR_NAME --sku Basic
+
+# Build and push image to ACR
+az acr build --registry $ACR_NAME --image log-analytics-mcp:latest .
+
+# Deploy with Managed Identity
+az containerapp create \
+  --name log-analytics-mcp-vnet \
+  --resource-group $RESOURCE_GROUP \
+  --environment vnet-test-env \
+  --image "${ACR_NAME}.azurecr.io/log-analytics-mcp:latest" \
+  --target-port 8000 \
+  --ingress external \
+  --env-vars "LOG_ANALYTICS_WORKSPACE_ID=$WORKSPACE_ID" "MCP_API_KEY=$API_KEY" \
+  --system-assigned \
+  --registry-server "${ACR_NAME}.azurecr.io"
+
+# Grant Log Analytics Reader role to Container App's Managed Identity
+PRINCIPAL_ID=$(az containerapp show --name log-analytics-mcp-vnet --resource-group $RESOURCE_GROUP --query "identity.principalId" -o tsv)
+az role assignment create \
+  --assignee $PRINCIPAL_ID \
+  --role "Log Analytics Reader" \
+  --scope "/subscriptions/.../workspaces/$WORKSPACE_NAME"
+```
+
+### Testing Private Link Blocking
+
+```bash
+# Test from OUTSIDE VNet (should fail if Private Link is properly configured)
+curl -X POST "https://log-analytics-mcp-outside.azurecontainerapps.io/mcp/" \
+  -H "Content-Type: application/json" \
+  -H "Accept: application/json, text/event-stream" \
+  -H "X-API-Key: $API_KEY" \
+  -d '{"jsonrpc":"2.0","method":"tools/call","params":{"name":"list_tables"},"id":1}'
+
+# Result: InsufficientAccessError - blocked by Private Link ❌
+
+# Test from INSIDE VNet (should succeed)
+curl -X POST "https://log-analytics-mcp-vnet.azurecontainerapps.io/mcp/" \
+  -H "Content-Type: application/json" \
+  -H "Accept: application/json, text/event-stream" \
+  -H "X-API-Key: $API_KEY" \
+  -d '{"jsonrpc":"2.0","method":"tools/call","params":{"name":"list_tables"},"id":1}'
+
+# Result: SUCCESS ✅ - tables returned
+```
+
+### Private Link Configuration
+
+For complete query blocking, configure:
+
+```bash
+# 1. Create AMPLS with Private Only mode
+az monitor private-link-scope create --name my-ampls --resource-group $RESOURCE_GROUP
+az monitor private-link-scope update --name my-ampls --resource-group $RESOURCE_GROUP \
+  --query-access PrivateOnly
+
+# 2. Disable public query access on workspace
+az monitor log-analytics workspace update \
+  --resource-group $RESOURCE_GROUP \
+  --workspace-name $WORKSPACE_NAME \
+  --set properties.publicNetworkAccessForQuery=Disabled
 ```
 
 ---
